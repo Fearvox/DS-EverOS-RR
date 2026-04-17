@@ -1,158 +1,149 @@
 # Silent Swallow — P0 Bug Reproduction
 
-## TL;DR
+## TL;DR (Updated 2026-04-17 02:15 after 14h debug)
 
-The CCR REPL silently drops user messages. Spinner starts, `caffeinate` prevents sleep for **exactly 5 seconds**, then the loading state ends — but **no HTTP request is ever sent** and **no UI message is ever rendered**.
+CCR REPL and pipe-mode (`-p`) both drop user messages silently.
+The hang is reproducible from a clean shell, reachable after a single
+`echo "say OK" | bun run dist/cli.js -p`, and survives every known
+bypass: PUA/EverMem/Vercel/Hookify `UserPromptSubmit` hooks neutralized,
+all MCP servers disabled (`--strict-mcp-config` + `ENABLE_CLAUDEAI_MCP_SERVERS=0`),
+311-skill attachment suppressed (`CLAUDE_CODE_DISABLE_ATTACHMENTS=1`),
+bare mode (`CLAUDE_CODE_SIMPLE=1`), Vercel plugin disabled at project
+scope, project-level `ds` function.
 
-The 5-second constant is not coincidental: it matches `HOOK_TIMEOUT_MS = 5000` in `src/utils/processUserInput/processUserInput.ts:182`. The `UserPromptSubmit` hook iterator hangs waiting for its next event, hits the timeout, and silently breaks out — leaving `executeUserInput` without any collected messages, so `onQuery` is never called.
+The hang is **not in** user-visible code paths tested. It is an
+**async await suspended** between `[STARTUP] MCP configs resolved in Xms`
+and any subsequent query activity. TCP 443 to MiniMax lb-ali IP
+(`47.252.72.253`) is **ESTABLISHED** but no HTTP request body appears to
+be sent. No error, no retry, no stream-idle-timeout, no log line for
+up to 3 minutes.
 
-## Symptoms
+## The exact 50-line hang window
 
-Running `bun run dev` (or `bun run dist/cli.js`), enter any prompt (e.g. `say hi`):
+Localized to `src/main.tsx` between:
 
-1. ⏳ Spinner appears briefly
-2. `[DEBUG] Started caffeinate to prevent sleep` is logged
-3. ~5 seconds later: `[DEBUG] Stopped caffeinate, allowing sleep`
-4. Spinner disappears
-5. **REPL returns to an idle prompt with no output, no error, no assistant message**
+- Line 2389 — last log: `[STARTUP] MCP configs resolved in 1ms (awaited at +34ms)`
+- Line 3200 — last log: `Found N plugins (M enabled, K disabled)` (from `pluginLoader.ts:3200` called from telemetry / prefetch path)
+- After line 3200 — **total silence**, no further `logForDebugging` ever fires.
 
-## Real log timeline (anonymized, from a real `--debug-file` run)
-
-```
-04:40:30.671  [handlePromptSubmit] queryGuard.isActive=false isExternalLoading=false input="say hi"
-04:40:30.696  [WARN] [3P telemetry] Event dropped (no event logger initialized): user_prompt
-              ↑ processTextPrompt.ts:52 — processTextPrompt ran and fired its OTel event
-04:40:30.737  [DEBUG] Started caffeinate to prevent sleep
-              ↑ isLoading = true (queryGuard reserved by executeUserInput)
-
-  ...  5.008 seconds of silence  ...
-       ↑ HOOK_TIMEOUT_MS = 5000 in processUserInput.ts:182
-
-04:40:35.745  [DEBUG] Stopped caffeinate, allowing sleep
-              ↑ isLoading = false (queryGuard released in the `finally`)
-```
-
-Notice what is **absent**:
-
-- No `[executeUserInput] processUserInput done` (we added an instrumentation log at `handlePromptSubmit.ts:528` that runs *after* the `processUserInput` call returns — it never fires)
-- No `query_process_user_input_end` checkpoint
-- No `onQuery` entry
-- No `POST /v1/messages`
-- No visible user or assistant message in the REPL
-
-## Root cause (narrowed down)
-
-The chain reaches `processUserInput` → `processUserInputBase` → `processTextPrompt` (which fires `user_prompt` OTel at line 52 and returns synchronously). Control returns to `processUserInput`, which then enters the `UserPromptSubmit` hook iterator at `processUserInput.ts:185`:
-
-```ts
-const HOOK_TIMEOUT_MS = 5000
-...
-const hookIterator = executeUserPromptSubmitHooks(inputMessage, ...)
-
-for await (const hookResult of {
-  [Symbol.asyncIterator]() {
-    return {
-      async next() {
-        const elapsed = Date.now() - hookStartTime
-        if (elapsed > HOOK_TIMEOUT_MS) {
-          logForDebugging(`[hooks] UserPromptSubmit timed out after ${elapsed}ms — skipping remaining hooks`)
-          return { done: true, value: undefined }
-        }
-        const result = await Promise.race([
-          hookIterator.next(),
-          new Promise(resolve => setTimeout(() => {
-            hookTimedOut = true
-            logForDebugging(...)
-            resolve({ done: true, value: undefined })
-          }, HOOK_TIMEOUT_MS - elapsed)),
-        ])
-        return result
-      },
-    },
-  },
-}) { ... }
-```
-
-The iterator races `hookIterator.next()` against a 5-second timer. In the failing repro, `hookIterator.next()` never resolves — which means `executeUserPromptSubmitHooks` is `await`-ing on an underlying hook child-process or plugin call that never signals completion.
-
-After the timeout fires, the outer `for await` exits with `done: true`. The code then proceeds, but because **no hook yielded any result** (no `additionalContexts`, no blocking error, no message), `result.messages` on return from `processUserInputBase` contains **only** the user message from `processTextPrompt`. Why then does `newMessages` end up empty at `handlePromptSubmit.ts:542`?
-
-Something between the hook-iterator timeout and the `newMessages.push(...result.messages)` at L514 swallows the user message. That is the exact bug to find.
-
-## Contributing hook sources (all of these inject into UserPromptSubmit)
+## Evidence timeline (clean repro, bare mode pipe)
 
 ```
-~/.claude/plugins/cache/evermem/evermem/0.1.3/hooks/hooks.json
-  → node inject-memories.js          (timeout 10s)
-~/.claude/plugins/cache/claude-plugins-official/vercel/*/hooks/hooks.json
-  → node user-prompt-submit-telemetry.mjs     (timeout 5s)
-  → node user-prompt-submit-skill-inject.mjs  (timeout 5s)   ← emits ~200 "Skill prompt: showing ..." lines per turn
-~/.claude/plugins/marketplaces/claude-plugins-official/plugins/hookify/hooks/hooks.json
-  → python3 userpromptsubmit.py      (timeout 10s)
-~/.claude/plugins/cache/pua-skills/pua/3.1.0/hooks/hooks.json
-  → bash frustration-trigger.sh      (timeout 5s) — outputs PLAIN TEXT (not JSON), which parseHookOutput handles via the `plainText` branch at hooks.ts:406
+06:03:04.963  GrowthBook: 1 override
+06:03:04.977  Remote managed settings 404
+06:03:04.990  Permission updates applied
+06:03:04.990  [STARTUP] Loading MCP configs...
+06:03:05.009  [STARTUP] Running setup()...
+06:03:05.012  [bare] Skipping skill dir discovery (no --add-dir)
+06:03:05.013  [STARTUP] setup() completed in 4ms
+06:03:05.014  [STARTUP] Loading commands and agents...
+06:03:05.020  getSkills returning: 0 skill dir, 0 plugin, 5 bundled
+06:03:05.021  [STARTUP] Commands and agents loaded in 7ms
+06:03:05.022  Skipping startup prefetches (last ran 1.7s ago)
+06:03:05.022  [STARTUP] MCP configs resolved in 1ms (awaited at +32ms)
+06:03:05.025  Fast mode unavailable
+06:03:05.028  [auto-mode] kickOutOfAutoIfNeeded applying
+06:03:05.045  Loaded 54 installed plugins
+06:03:05.053  Plugin {typescript,pyright,csharp,...}-lsp: no entry.skills
+06:03:05.054  Loaded hooks from vercel/evermem/security-guidance/hookify/ralph-loop/pua/superpowers/codex/learning-output-style
+06:03:05.055  Found 50 plugins (39 enabled, 11 disabled)
+ ─────────────  *** HANG — no log for 25+ seconds, process killed ***
 ```
 
-When all five `UserPromptSubmit` hook arrays are **emptied** (`.hooks.UserPromptSubmit = []` via `jq`), the silent-swallow **still reproduces**. That means the bug lives in the CCR iterator machinery itself, not in any one hook. The hooks only make the symptom louder.
+## What we know about the network state during hang
 
-## Environment
+`lsof -p <bun_pid>` shows one live HTTPS connection:
 
-- macOS 15.x (Darwin 24.6.0)
-- Bun 1.3.11
-- Tested with both `bun run dev` (watch mode) and `bun run dist/cli.js` (static bundle) — both fail identically
-- Direct `curl` to Anthropic `/v1/messages` with OAuth token succeeds (API is reachable; the bug is purely client-side)
+```
+bun  31743  0xvox  17u  IPv4  ...  TCP  10.6.3.196:58536 -> 47.252.72.253:https (ESTABLISHED)
+```
 
-## Pre-added debug instrumentation
+`dig +short api.minimax.io` resolves to exactly `47.252.72.253` (lb-ali.minimax.io, Alibaba Cloud LLC, US). So the TCP layer is fine — CCR has opened a keepalive socket to the provider. But no request body or response passes through; no log line mentions the POST, the first chunk, retries, or stream-idle-timeout.
 
-We injected an extra log at the boundary in `src/utils/handlePromptSubmit.ts:528`. Search for the literal `[executeUserInput] processUserInput done`. If it appears in `/tmp/ccr-live.log`, the fault is *after* `processUserInput` returns; if it does **not** appear, the fault is *inside* `processUserInput`'s hook iterator path — that is the state we observed.
+## What we verified the bug is NOT
 
-## How to reproduce cleanly
+| Candidate | Ruled out by |
+|---|---|
+| MiniMax endpoint slow | Direct curl `/v1/messages` non-stream 2.9s / stream TTFB 1.1s (HTTP 200, full SSE) |
+| Network / DNS | `lsof` shows live ESTABLISHED socket to correct IP |
+| OAuth expiry | `settings.json.env.ANTHROPIC_AUTH_TOKEN` valid 125 chars; direct curl succeeds |
+| PUA/EverMem/Vercel/Hookify `UserPromptSubmit` hooks | 6 `hooks.json` all `UserPromptSubmit: []` (backups kept with `.bak-*` suffix) |
+| claude.ai MCP servers | `ENABLE_CLAUDEAI_MCP_SERVERS=0` gates them in `src/services/mcp/claudeai.ts:42` |
+| Local MCP servers | `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` |
+| Vercel plugin hooks | `plugins.vercel@claude-plugins-official: false` in project `.claude/settings.json` |
+| 311-skill attachment | `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` returns `[]` from `src/utils/attachments.ts:752-761` |
+| Plugin auto-install hang | `CLAUDE_CODE_SIMPLE=1` bypasses `installPluginsForHeadless` completely — same hang |
+| REPL-specific path | Pipe mode (`-p`) also hangs identically |
+| Hook iterator 5s timeout | Now past timeout; no `Hook UserPromptSubmit timed out` log |
+| Signature block / thinking-only response | MiniMax's own direct curl response parses fine; never reached |
+
+## Hypotheses still live
+
+1. **`apiPreconnect` or a similar prefetch** opens the TCP socket during startup (explaining the ESTABLISHED connection) and then some downstream `await` loops on an unrelated unresolved promise.
+2. **`loadAllPluginsCacheOnly` re-entrancy** — `main.tsx:282` fires `void loadAllPluginsCacheOnly().then(...)`; a `.then()` callback may throw and get swallowed by `.catch(err => logError(err))` while the main path awaits the cached promise.
+3. **Managed settings / mDNS probe** — `waitForRemoteManagedSettingsToLoad` or the mTLS configure may be blocked on a kernel call.
+4. **React tree bootstrap in non-interactive mode** — even in `-p`, something renders and awaits. Some component's `useEffect` may never finish.
+
+## Next session — surgical plan (15-minute fix)
+
+1. Add 8 numbered `logForDebugging('[STARTUP] checkpoint N at main.tsx:LINE')` at every major `await` in `main.tsx` between lines 2389 and 3200 (every ~100 lines).
+2. Rebuild and re-run the bare-mode pipe reproduction. First missing checkpoint number pinpoints the hang to a 100-line block.
+3. Read that block; locate the offending `await` or `void`; add a timeout or error propagation.
+4. Add a regression test in `tests/` that spawns pipe mode with `timeout 5` and expects completion.
+
+Checkpoints to plant (reading main.tsx bottom-up from the "Found N plugins" side up to `[STARTUP] MCP configs resolved`):
+
+```
+  [STARTUP] before isNonInteractiveSession branch
+  [STARTUP] after hooksPromise construction
+  [STARTUP] after mcpPromise construction
+  [STARTUP] after logSessionTelemetry
+  [STARTUP] before runHeadless/renderInteractive dispatch
+  [STARTUP] after apiPreconnect decision
+  [STARTUP] after logPluginsEnabledForSession
+  [STARTUP] before main async action handler returns
+```
+
+## Environment config already applied (keep for next session)
+
+`~/.claude/plugins/**/hooks.json` UserPromptSubmit arrays emptied for: pua-skills (cache + marketplace), evermem (cache + marketplace), vercel, hookify. Backups: `hooks.json.bak-20260417-*`.
+
+`~/.claude/projects/-Users-0xvox-...-dreamy-mccarthy-a22317/.claude/settings.json` has `plugins.vercel@claude-plugins-official: false`.
+
+Source code has debug instrumentation in `src/utils/handlePromptSubmit.ts` (L528 `[executeUserInput] processUserInput done ...`) and `src/services/api/claude.ts` (L1973 `[api] request SENT`, L1997 `[api] response HEADERS`, L2105 `[api] FIRST CHUNK`). None of these fire in current repros — confirming the hang is before API client invocation.
+
+## Relevant files
+
+| File | Role |
+|---|---|
+| `src/main.tsx` | The 50-line hang window between L2389 and L3200 |
+| `src/cli/print.ts` | Pipe-mode entry (`runHeadless`) — downstream of the hang |
+| `src/utils/handlePromptSubmit.ts` | REPL-mode entry — downstream of the hang |
+| `src/services/api/claude.ts` | API client — downstream of the hang |
+| `src/utils/plugins/pluginLoader.ts:3200` | Emits the `Found N plugins` log that is the last visible breadcrumb |
+| `src/utils/attachments.ts:752-761` | `CLAUDE_CODE_DISABLE_ATTACHMENTS` gate (works; skills skipped in repros) |
+| `src/services/mcp/claudeai.ts:42` | `ENABLE_CLAUDEAI_MCP_SERVERS` gate (works) |
+| `.planning/POST-MORTEM-REPL-HANG-2026-04-16.md` (main repo only) | Prior 4-hour investigation; identifies a different root cause (vibe-island-bridge hook, already deleted) |
+
+## Reproducing in one command
 
 ```bash
-# 1. Install
-bun install
-
-# 2. Rebuild to pick up the instrumentation above
-bun run build
-
-# 3. Clear any stale debug log
 : > /tmp/ccr-live.log
-
-# 4. Run the static bundle
-bun run dist/cli.js --debug-file /tmp/ccr-live.log
-
-# 5. In the REPL, type:
-say hi
-
-# 6. Wait 5 seconds. Spinner disappears with no reply.
-
-# 7. From another terminal:
-grep -nE "handlePromptSubmit|executeUserInput|processUserInput|user_prompt|caffeinate|Hook UserPromptSubmit|hook.*timed out" /tmp/ccr-live.log | tail -40
+CLAUDE_CODE_DISABLE_ATTACHMENTS=1 \
+ENABLE_CLAUDEAI_MCP_SERVERS=0 \
+CLAUDE_CODE_SIMPLE=1 \
+bun run dist/cli.js -p \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --debug-file /tmp/ccr-live.log \
+  --output-format text <<< "say OK"
+# Hangs for 2–3 minutes. Ctrl+C. tail /tmp/ccr-live.log — last line is
+# "Found N plugins (M enabled, K disabled)".
 ```
 
-You should see the four log lines documented in the timeline above. You should **not** see `[executeUserInput] processUserInput done` or any `Hook UserPromptSubmit ... success` or `onQuery` line.
+## Scope guardrails for the collaborator (unchanged)
 
-## What a good fix looks like
-
-Two legitimate fixes, either independently or together:
-
-1. **Make the hook iterator robust to hook commands that never return.** In `executeUserPromptSubmitHooks` (`src/utils/hooks.ts`), enforce a per-hook subprocess timeout with SIGKILL and yield a `{ outcome: 'error' }` result on timeout so the outer iterator receives a real signal rather than a silent `done: true`. The current outer 5-second race abandons the iterator but leaves downstream code unaware.
-2. **When the hook iterator completes without producing any messages, still deliver the user's original message to `onQuery`.** At `processUserInput.ts`, after the `for await` loop, assert that `result.messages` already contains the user's turn (built by `processTextPrompt`). If a subsequent step drops it, log an error with `result` shape and re-add the base user message.
-
-A regression test in `tests/` should simulate a UserPromptSubmit hook whose subprocess hangs forever and assert that the outer pipeline still produces a user message and reaches `onQuery` within ≤ 6 seconds.
-
-## Scope guardrails for the collaborator
-
-- Do **not** touch model capability code (`src/utils/model/capabilities.ts`, `src/utils/model/configs.ts`, `src/utils/model/defineModel.ts`) — those were just refactored and have full parity tests.
-- Do **not** add new runtime dependencies — keep the build single-file.
-- Do **not** reintroduce Node-only APIs — Bun is the sole runtime.
-- **Do** add defensive instrumentation at every async boundary in `processUserInput`; the codebase is already `logForDebugging`-heavy and one more well-placed log is fine.
-- **Do** prefer returning a visible system error over silent swallowing.
-
-## Out of scope (but context)
-
-The codebase also has a longer-term refactor roadmap under `docs/superpowers/plans/` — a "model capability registry" task already landed (see `src/utils/model/capabilities.ts`). Welcome follow-ups **after** the silent-swallow root cause is fixed:
-
-- Splitting `api/relay/index.ts` into `{handler, transforms, auth, debug}.ts`
-- Unifying `isMaxSubscriber / isProSubscriber / isTeamSubscriber` behind a single entitlement API
-- Scrubbing decompiled React Compiler `_c()` memoization noise (codemod candidate)
+- Do **not** touch model capability code (`src/utils/model/capabilities.ts`, `defineModel.ts`, `configs.ts`) — parity tests protect it.
+- Do **not** add runtime dependencies.
+- Do **not** reintroduce Node-only APIs.
+- **Do** instrument every async boundary between main.tsx:2389 and pluginLoader.ts:3200.
+- **Do** add a regression test asserting pipe mode completes in ≤ 10s on an empty plugin set.
