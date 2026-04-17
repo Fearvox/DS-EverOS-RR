@@ -1,0 +1,93 @@
+import { getInitialSettings } from '../utils/settings/settings.js'
+
+export function getSpinnerVerbs(): string[] {
+  const settings = getInitialSettings()
+  const config = settings.spinnerVerbs
+  if (!config) {
+    return SPINNER_VERBS
+  }
+  if (config.mode === 'replace') {
+    return config.verbs.length > 0 ? config.verbs : SPINNER_VERBS
+  }
+  return [...SPINNER_VERBS, ...config.verbs]
+}
+
+// Spinner verbs for loading messages — DASH speed/botanical fusion
+export const SPINNER_VERBS = [
+  'Accelerating',
+  'Alchemizing',
+  'Blitzing',
+  'Blooming',
+  'Bolting',
+  'Boosting',
+  'Branching',
+  'Budding',
+  'Burning',
+  'Careening',
+  'Charging',
+  'Compiling',
+  'Computing',
+  'Crystallizing',
+  'Cultivating',
+  'Dashing',
+  'Decrypting',
+  'Deploying',
+  'Detonating',
+  'Distilling',
+  'Drafting',
+  'Encoding',
+  'Executing',
+  'Fermenting',
+  'Flashing',
+  'Flowering',
+  'Forging',
+  'Fusing',
+  'Germinating',
+  'Grafting',
+  'Growing',
+  'Harvesting',
+  'Hashing',
+  'Hurtling',
+  'Igniting',
+  'Indexing',
+  'Kindling',
+  'Launching',
+  'Leafing',
+  'Linking',
+  'Mapping',
+  'Metamorphosing',
+  'Overtaking',
+  'Parsing',
+  'Patching',
+  'Pivoting',
+  'Pollinating',
+  'Propagating',
+  'Propelling',
+  'Pruning',
+  'Punching',
+  'Racing',
+  'Redlining',
+  'Rendering',
+  'Resolving',
+  'Revving',
+  'Rocketing',
+  'Rooting',
+  'Routing',
+  'Seeding',
+  'Shattering',
+  'Slipstreaming',
+  'Sprouting',
+  'Sprinting',
+  'Surging',
+  'Syncing',
+  'Tearing',
+  'Tending',
+  'Throttling',
+  'Transmuting',
+  'Unfurling',
+  'Vaulting',
+  'Verduring',
+  'Weaving',
+  'Wiring',
+  'Zeroing',
+]

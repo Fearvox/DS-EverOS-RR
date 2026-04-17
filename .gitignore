@@ -1,0 +1,20 @@
+node_modules
+.DS_Store
+dist
+coverage
+.env
+*.log
+.idea
+.vscode
+*.suo
+*.lock
+
+# Session transcripts (private conversation data)
+.claude/session-transcript.jsonl
+.claude/session-data/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/projects/
+.gstack/
+.vercel
+.env*.local

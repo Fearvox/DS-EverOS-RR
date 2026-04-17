@@ -1,0 +1,10 @@
+# Vendored third-party skills and commands (ECC + Codex plugin)
+.claude/skills/everything-claude-code/** linguist-vendored
+.claude/commands/** linguist-vendored
+.claude/codex-plugin/** linguist-vendored
+.claude/hooks/** linguist-vendored
+.claude/agents/** linguist-vendored
+
+# Session data (should not be committed but mark just in case)
+.claude/session-transcript.jsonl linguist-generated
+.claude/session-data/** linguist-generated

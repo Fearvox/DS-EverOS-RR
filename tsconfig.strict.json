@@ -1,0 +1,42 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictPropertyInitialization": true,
+    "noImplicitReturns": true,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": [
+    "src/types/message.ts",
+    "src/types/permissions.ts",
+    "src/state/AppStateStore.ts",
+    "src/state/store.ts",
+    "src/bootstrap/state.ts",
+    "src/Tool.ts",
+    "src/types/__tests__/message.test.ts",
+    "src/types/__tests__/permissions.test.ts",
+    "src/services/api/streamEventSchema.ts",
+    "src/services/api/__tests__/streamEvents.test.ts",
+    "src/types/global.d.ts",
+    "src/types/internal-modules.d.ts",
+    "src/types/strict-shims.d.ts",
+    "src/tools/__tests__/createTestToolUseContext.ts",
+    "src/tools/BashTool/__tests__/BashTool.test.ts",
+    "src/tools/FileEditTool/__tests__/FileEditTool.test.ts",
+    "src/tools/AgentTool/__tests__/AgentTool.test.ts",
+    "src/tools/GrepTool/__tests__/GrepTool.test.ts",
+    "src/services/api/__tests__/withRetry.test.ts",
+    "src/services/api/__tests__/providers.test.ts",
+    "src/utils/__tests__/sessionStorageAtomic.test.ts",
+    "src/services/api/__tests__/streamWatchdog.test.ts",
+    "src/utils/permissions/__tests__/permissions.test.ts",
+    "src/services/compact/__tests__/autoCompact.test.ts",
+    "src/utils/__tests__/sessionStorage.test.ts",
+    "src/query/__tests__/query.test.ts"
+  ]
+}
