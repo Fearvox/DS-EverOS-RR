@@ -89,7 +89,7 @@
     "react-compiler-runtime": "^1.0.0",
     "react-reconciler": "latest",
     "semver": "latest",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.3",
     "shell-quote": "latest",
     "signal-exit": "latest",
     "stack-utils": "latest",
